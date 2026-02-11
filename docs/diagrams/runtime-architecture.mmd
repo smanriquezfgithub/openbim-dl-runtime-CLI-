@@ -1,0 +1,39 @@
+flowchart TB
+
+  CLI[CLI Frontend]
+
+  Parser[Parser]
+  AST[AST Builder]
+  TypeChecker[Type Checker]
+  CompilePlan[Compile Plan]
+
+  IFCLoader[IFC Loader]
+  GraphBuilder[Graph Builder]
+
+  Evaluator[Expression Evaluator]
+
+  Export[Export Engines]
+  Manifest[Manifest Generator]
+
+  Output[Artifacts]
+
+  CLI --> Parser
+  Parser --> AST
+  AST --> TypeChecker
+  TypeChecker --> CompilePlan
+
+  CLI --> IFCLoader
+  IFCLoader --> GraphBuilder
+
+  GraphBuilder --> Evaluator
+  CompilePlan --> Evaluator
+
+  Evaluator --> Export
+  Export --> Output
+
+  CLI --> Manifest
+  CompilePlan --> Manifest
+  IFCLoader --> Manifest
+  GraphBuilder --> Manifest
+  Export --> Manifest
+  Manifest --> Output
