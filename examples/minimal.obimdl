@@ -1,0 +1,12 @@
+source {
+  path "model.ifc";
+}
+
+derive {
+  feature a: 1 + 2;
+}
+
+export {
+  format parquet;
+  path "./out/data.parquet";
+}
