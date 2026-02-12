@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
-from lark import Lark, Transformer, Token, Tree
+from lark import Lark, Transformer, Token
 from lark.exceptions import LarkError, UnexpectedInput
 
 
@@ -29,19 +29,19 @@ class RecipeParseError(Exception):
 
 def parse_recipe_text(text: str) -> Dict[str, Any]:
     """
-    Parse OpenBIM-DL recipe text and return a normalized structure.
+    Parse OpenBIM-DL v0.1 recipe text and return a normalized structure.
 
-    Returns a dict with keys:
-      - source: dict
-      - views: list[dict]
-      - derive: dict
-      - synthesize: dict|None
-      - split: dict|None
-      - exports: list[dict]
+    Output shape (parser-level):
+      - source: {"_kind":"source","body":[stmts]}
+      - views: [{"_kind":"view","name":str,"body":[stmts]}...]
+      - derive: {"_kind":"derive","body":[assign...]}
+      - synthesize: {"_kind":"synthesize","body":[assign...]} | None
+      - split: {"_kind":"split","body":[assign...]} | None
+      - exports: [{"_kind":"export","kind":str,"body":[assign...]}...]
 
     Notes:
-      - This is a syntactic parser (MVP). It does not type-check.
-      - Expressions are returned as a lightweight AST (Tree) structure.
+      - This is syntactic parsing + lightweight expression AST.
+      - Semantics/type validation are handled by ast.py / typecheck.py.
     """
     try:
         tree = _PARSER.parse(text)
@@ -51,7 +51,6 @@ def parse_recipe_text(text: str) -> Dict[str, Any]:
         diag = _to_diagnostic(text, e)
         raise RecipeParseError(diag) from e
     except LarkError as e:
-        # Fallback: generic parse error
         diag = ParseDiagnostic(
             message=f"Parse error: {e}",
             line=1,
@@ -67,18 +66,23 @@ def parse_recipe_file(path: Union[str, Path]) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Grammar (v0.1 - MVP)
+# Grammar (OpenBIM-DL v0.1 — spec canonical)
 # -----------------------------
 #
-# Goals:
-#  - Parse document structure blocks
-#  - Parse key-value params
-#  - Parse expressions with operators (basic precedence)
+# Document:
+#   source { ... }
+#   view <Name> { select node|edge; where <expr>; ... }
+#   derive { <name> = <expr>; ... }
+#   synthesize? { ... }   (parsed, may be ignored by runtime v0.2)
+#   split? { ... }        (parsed, may be ignored by runtime v0.2)
+#   export <kind> { format="parquet"; path="..."; ... }  (kind: tabular|graph|text)
 #
-# Non-goals in this step:
-#  - Full validation (type checking)
-#  - Full catalog binding (function signatures)
-#  - All syntactic sugar
+# Statements:
+#   - assign: IDENT "=" expr ";"
+#   - view: select + where (and optional assigns inside view if spec allows later)
+#
+# Comments:
+#   - line comments starting with '#'
 #
 
 _OPENBIMDL_GRAMMAR = r"""
@@ -87,43 +91,30 @@ _OPENBIMDL_GRAMMAR = r"""
 document: source_block view_block* derive_block synthesize_block? split_block? export_block+
 
 source_block: "source" block
-view_block: "view" block
+
+view_block: "view" IDENT view_block_body
+view_block_body: "{" view_stmt* "}"
+
 derive_block: "derive" block
 synthesize_block: "synthesize" block
 split_block: "split" block
-export_block: "export" block
 
-block: "{" stmt* "}"
+export_block: "export" IDENT block
 
-?stmt: assign_stmt
-     | emit_stmt
-     | select_stmt
-     | where_stmt
-     | label_stmt
-     | format_stmt
-     | path_stmt
-     | by_stmt
-     | feature_stmt
-     | edge_stmt
-     | node_stmt
-     | COMMENT
+block: "{" assign_stmt* "}"
+
+?view_stmt: select_stmt
+         | where_stmt
+         | assign_stmt    -> view_assign_stmt
+
+select_stmt: "select" ("node" | "edge") ";"
+where_stmt: "where" expr ";"
 
 assign_stmt: IDENT "=" expr ";"
-emit_stmt: "emit" IDENT ":" expr ";"
 
-select_stmt: "select" expr ";"
-where_stmt: "where" expr ";"
-label_stmt: "label" IDENT "=" expr ";"
-
-format_stmt: "format" IDENT ";"
-path_stmt: "path" STRING ";"
-by_stmt: "by" IDENT "(" [arg_list] ")" ";"
-
-feature_stmt: "feature" IDENT ":" expr ";"
-node_stmt: "node" "features" "{" feature_stmt* "}"
-edge_stmt: "edge" "features" "{" feature_stmt* "}"
-
-?arg_list: expr ("," expr)*
+# -----------------------------
+# Expressions (operators + calls + access)
+# -----------------------------
 
 ?expr: logic_or
 
@@ -166,6 +157,8 @@ func_call: IDENT "(" [arg_list] ")"
 access: IDENT ("." IDENT)* indexer*
 indexer: "[" expr "]"
 
+?arg_list: expr ("," expr)*
+
 ?literal: NUMBER      -> number
         | STRING      -> string
         | "true"      -> true
@@ -191,7 +184,6 @@ COMMENT: /#[^\n]*/
 
 class _ToDictTransformer(Transformer):
     def document(self, items):
-        # items: source, views..., derive, maybe synth, maybe split, exports...
         out: Dict[str, Any] = {
             "source": None,
             "views": [],
@@ -218,11 +210,19 @@ class _ToDictTransformer(Transformer):
 
         return out
 
+    # --- blocks
+
     def source_block(self, items):
         return {"_kind": "source", "body": items[0]}
 
     def view_block(self, items):
-        return {"_kind": "view", "body": items[0]}
+        # items: IDENT, view_block_body(list of statements)
+        name = str(items[0])
+        body = items[1]
+        return {"_kind": "view", "name": name, "body": body}
+
+    def view_block_body(self, items):
+        return items
 
     def derive_block(self, items):
         return {"_kind": "derive", "body": items[0]}
@@ -234,60 +234,34 @@ class _ToDictTransformer(Transformer):
         return {"_kind": "split", "body": items[0]}
 
     def export_block(self, items):
-        return {"_kind": "export", "body": items[0]}
+        # items: IDENT(kind), block(assigns)
+        kind = str(items[0])
+        body = items[1]
+        return {"_kind": "export", "kind": kind, "body": body}
 
     def block(self, items):
-        # items are stmts; keep as list of statements (dicts)
         return items
+
+    # --- statements
 
     def assign_stmt(self, items):
         name = str(items[0])
         expr = items[1]
         return {"type": "assign", "name": name, "expr": expr}
 
-    def emit_stmt(self, items):
-        name = str(items[0])
-        expr = items[1]
-        return {"type": "emit", "name": name, "expr": expr}
+    def view_assign_stmt(self, items):
+        # same payload as assign_stmt, but tag where it came from
+        st = items[0]
+        st["in_view"] = True
+        return st
 
     def select_stmt(self, items):
-        return {"type": "select", "expr": items[0]}
+        # items: "node" or "edge" token
+        target = str(items[0])
+        return {"type": "select", "target": target}
 
     def where_stmt(self, items):
         return {"type": "where", "expr": items[0]}
-
-    def label_stmt(self, items):
-        name = str(items[0])
-        expr = items[1]
-        return {"type": "label", "name": name, "expr": expr}
-
-    def format_stmt(self, items):
-        return {"type": "format", "format": str(items[0])}
-
-    def path_stmt(self, items):
-        return {"type": "path", "path": _unquote(str(items[0]))}
-
-    def by_stmt(self, items):
-        fn = str(items[0])
-        args = items[1:] and items[1] or []
-        # args might come as list already depending on transformer behavior
-        if isinstance(args, list):
-            pass
-        else:
-            args = [args]
-        return {"type": "by", "fn": fn, "args": args}
-
-    def feature_stmt(self, items):
-        name = str(items[0])
-        expr = items[1]
-        return {"type": "feature", "name": name, "expr": expr}
-
-    def node_stmt(self, items):
-        # items are feature statements
-        return {"type": "node_features", "features": items}
-
-    def edge_stmt(self, items):
-        return {"type": "edge_features", "features": items}
 
     def arg_list(self, items):
         return items
@@ -309,7 +283,7 @@ class _ToDictTransformer(Transformer):
     def null(self, _):
         return {"_expr": "null", "value": None}
 
-    # --- expressions: keep lightweight structure
+    # --- expressions
 
     def func_call(self, items):
         fn = str(items[0])
@@ -321,7 +295,7 @@ class _ToDictTransformer(Transformer):
         return {"_expr": "call", "fn": fn, "args": args}
 
     def access(self, items):
-        # first token is IDENT, rest could be .IDENT segments and indexers
+        # access: IDENT ("." IDENT)* indexer*
         base = str(items[0])
         parts: List[Any] = [{"kind": "ident", "name": base}]
         for it in items[1:]:
@@ -330,7 +304,6 @@ class _ToDictTransformer(Transformer):
             elif isinstance(it, dict) and it.get("_expr") == "index":
                 parts.append({"kind": "index", "expr": it["expr"]})
             else:
-                # fallback
                 parts.append({"kind": "unknown", "value": it})
         return {"_expr": "access", "parts": parts}
 
@@ -379,7 +352,6 @@ _PARSER = Lark(
 
 
 def _unquote(s: str) -> str:
-    # s is an ESCAPED_STRING including quotes
     if len(s) >= 2 and s[0] == s[-1] == '"':
         return s[1:-1].encode("utf-8").decode("unicode_escape")
     if len(s) >= 2 and s[0] == s[-1] == "'":
@@ -388,7 +360,6 @@ def _unquote(s: str) -> str:
 
 
 def _to_diagnostic(source: str, e: UnexpectedInput) -> ParseDiagnostic:
-    # Best-effort context snippet
     line = getattr(e, "line", 1) or 1
     column = getattr(e, "column", 1) or 1
     lines = source.splitlines()
@@ -396,11 +367,10 @@ def _to_diagnostic(source: str, e: UnexpectedInput) -> ParseDiagnostic:
     pointer = " " * max(column - 1, 0) + "^"
     ctx = f"{context_line}\n{pointer}"
     msg = "Unexpected input"
-    if hasattr(e, "get_context"):
-        try:
-            msg = str(e)
-        except Exception:
-            pass
+    try:
+        msg = str(e)
+    except Exception:
+        pass
     return ParseDiagnostic(
         message=msg,
         line=line,
